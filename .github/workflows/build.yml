@@ -42,7 +42,6 @@ jobs:
 
       - name: Build Mini Live Server
         run: |
-          cd "$env:GITHUB_WORKSPACE\cmd\mini-live-server"
           go mod init mini-live-server
           go mod tidy
           $env:CGO_ENABLED=0
