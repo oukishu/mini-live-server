@@ -1,0 +1,58 @@
+!.gitignore
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Node.js
+dist/
+build/
+node_modules/
+npm-debug.log
+yarn-error.log
+.env
+
+!frontend/dist/
+!frontend/dist/**
+
+# Visual Studio
+.vscode/
+
+# JetBrains IDEs
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Cache
+.cache/
+.parcel-cache/
+.nuxt/
+.output/
+.vite/
+
+# Log
+*.log
+*.log.*
+.trash/
+Thumbs.db.encrypted
+ehthumbs.db
+
+# Other
+*~
+*.swp
+*.swo
+.project
+.settings/
+.classpath
+.pnpm-debug.log
+.eslintcache
+.stylelintcache
