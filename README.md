@@ -81,4 +81,4 @@ The page includes a live JSON preview with syntax highlighting so you can see ex
 
 ## License
 
-MIT
+GPL-3.0
