@@ -1,84 +1,84 @@
 # mini-live-server
 
-A tiny zero-dependency dev server in Go — static file serving, API reverse proxy, page route rewriting, and mock REST endpoints, all driven by one `config.json`.
-
-## Features
-
-- **Static file server** — serves any directory as-is, no build step
-- **API reverse proxy** — forward a path prefix (e.g. `/api`) to a real backend
-- **Route rewriting** — map arbitrary request paths to specific HTML files (useful for SPA-style routing without a real router)
-- **Mock REST API** — define fake endpoints with custom status, delay, and JSON response, no backend required
-- **Single config file** — everything above is configured through one `config.json`, generated visually with the included **[`mini-live-server.html`](https://oukishu.github.io/mini-live-server-editor.html)** editor
-- **No dependencies** — pure Go standard library, single binary
+A single-file, zero-dependency local dev server: static file serving + Mock API + path rewriting + reverse proxy (with CORS).
 
 ## Quick start
 
 ```bash
-go build -o mini-live-server main.go
-./mini-live-server -c ./config.json
+go build -o mini-live-server mini-live-server.go
+./mini-live-server -config=config.json
 ```
 
-Or run directly without building:
+Without a `config.json`, it starts with built-in defaults (listens on `:8080`, static directory `./public`).
 
-```bash
-go run main.go -c ./config.json
-```
+Open **[`mini-live-server.html`](https://oukishu.github.io/mini-live-server-editor.html)** in a browser, fill in the form, and the JSON updates live on the right. Click **Export config.json** to download it. Use **Import config.json** to load an existing config file back into the form and keep editing.
 
 ## Command-line flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `-c`, `-config` | `./config.json` | Path to the config file |
-| `-dir` | *(from config)* | Static file root directory — overrides `config.json` if set |
-| `-port` | *(from config)* | Listening port — overrides `config.json` if set |
-| `-api` | *(from config)* | API route prefix — overrides `config.json` if set |
-| `-target` | *(from config)* | Backend proxy target URL — overrides `config.json` if set |
+Flags only override the matching config.json field when explicitly passed — an unpassed flag never clobbers a file-based setting with its zero value.
 
-Flags only override `config.json` when explicitly passed — omitted flags never clobber values from the config file.
+```
+-config, -c   Path to config file (default ./config.json)
+-bind         Listen address, e.g. :8080
+-dir          Static files root directory
+-port         Port number, equivalent to -bind ":<port>" (legacy, kept for compatibility)
+-api          Deprecated: paired with -target, folded into router
+-target       Deprecated: single backend URL, folded into router
+-cors         Enable CORS handling
+-origin       Access-Control-Allow-Origin value
+```
 
-## config.json
+`router`, `routes`, and `mocks` are currently config.json-only; there are no corresponding flags.
 
-```json
+## Request handling order
+
+Each request is matched in a fixed order; the first match wins:
+
+1. **Mock** — path + method matches an entry in `mocks`, returns the canned response directly
+2. **Proxy** — path matches the longest prefix in `router`, forwarded to that backend
+3. **Routes** — path matches the `routes` rewrite table, rewritten to the target file path
+4. **Static** — served from the `dir` static directory; a directory without `index.html` returns 403 (no directory listing)
+
+## config.json fields
+
+Proxying has exactly one concept: `router` — **path prefix → backend URL**. A single-backend proxy is just a router with one rule; add more rules to fan requests out to multiple backends by prefix, longest prefix wins.
+
+```jsonc
 {
-  "dir": "./public",
-  "port": 8080,
-  "api": "/api",
-  "target": "http://localhost:3000",
-  "routes": {
-    "/old-page": "/new-page.html"
+  // ---- listening ----
+  "bind": ":8080",          // listen address, takes priority over port
+  "port": 8080,             // legacy field, equivalent to bind ":<port>"
+
+  // ---- static files ----
+  "dir": "./public",        // static root; leave blank to disable static serving (proxy-only setups)
+
+  // ---- proxy routing: prefix -> backend URL, the only proxy concept ----
+  "router": {
+    "/api": "http://localhost:3000",       // single-backend setups just need this one entry
+    "/api/v2": "http://127.0.0.1:9000",    // or fan out to multiple backends by prefix
+    "/upload": "http://127.0.0.1:9100"
   },
+
+  // ---- CORS (from the original gocors) ----
+  "cors": true,
+  "origin": "",              // leave blank to reflect the request's Origin header, or hardcode one
+
+  // ---- static path rewriting ----
+  "routes": {
+    "/about": "/about/index.html"
+  },
+
+  // ---- mock endpoints ----
   "mocks": [
     {
-      "path": "/api/user",
-      "method": "GET",
+      "path": "/api/ping",
+      "method": "GET",       // leave blank to match any method
       "status": 200,
-      "delay_ms": 100,
-      "response": { "id": 1, "name": "test" }
+      "delay_ms": 0,
+      "response": { "ok": true }
     }
   ]
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `dir` | string | Static file root directory |
-| `port` | number | Listening port |
-| `api` | string | API route prefix that gets proxied |
-| `target` | string | Backend URL that `api` requests are forwarded to (leave empty to disable proxying) |
-| `routes` | object | Map of request path → target file path, rewritten before static file lookup |
-| `mocks` | array | List of mock endpoints; each takes `path`, `method` (empty matches any), `status`, `delay_ms`, and `response` |
-
-Any field omitted from `config.json` falls back to a built-in default (`dir=./public`, `port=8080`, `api=/api`, `target=http://localhost:3000`, `routes={}`, `mocks=[]`).
-
-## Generating config.json visually
-
-Rather than hand-writing the JSON, open **[`mini-live-server.html`](https://oukishu.github.io/mini-live-server-editor.html)** — it's a self-contained static page with no build step and no server required. Click the link to open it directly in your browser (or just double-click the file locally), fill in the fields, and:
-
-- **Export** to download a ready-to-use `config.json`
-- **Import** an existing `config.json` to edit it further
-
-The page includes a live JSON preview with syntax highlighting so you can see exactly what will be written before exporting.
-
-## License
-
-GPL-3.0
+`api` / `target` can still appear in config.json (see migration notes below), but they're only folded into a `router` rule at load time. At runtime the program no longer distinguishes "single-backend mode" from "multi-backend mode" — it's all `router`.

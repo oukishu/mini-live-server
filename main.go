@@ -10,54 +10,82 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
 
-// MockAPI struct definition
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+// MockAPI describes a single fake endpoint served directly from config.json,
+// without touching the backend at all.
 type MockAPI struct {
-	Path    string `json:"path"`
-	Method  string `json:"method"`
-	Status  int    `json:"status"`
-	DelayMS int    `json:"delay_ms"`
+	Path     string `json:"path"`
+	Method   string `json:"method"`
+	Status   int    `json:"status"`
+	DelayMS  int    `json:"delay_ms"`
 	Response any    `json:"response"`
 }
 
-// Config unified configuration struct corresponding to config.json
+// Config is the full, unified configuration. It merges what used to be two
+// separate tools:
+//   - mini-live-server: static file serving, mock APIs, path rewrites
+//   - gocors: CORS handling and multi-prefix reverse proxying
+//
+// There is exactly one proxy concept: Router, a map of path prefix -> backend
+// origin. A single-backend setup is just a Router with one entry.
 type Config struct {
-	Dir    string            `json:"dir"`
-	Port   int               `json:"port"`
-	API    string            `json:"api"`
-	Target string            `json:"target"`
-	Routes map[string]string `json:"routes"`
+	Bind string `json:"bind"` // listen address, e.g. ":8080" or "127.0.0.1:8080"
+	Port int    `json:"port"` // legacy alternative to Bind (":<port>")
+	Dir  string `json:"dir"`  // static file root; "" disables static serving
+
+	// Router maps a path prefix to a backend origin. The longest matching
+	// prefix wins. A single-backend proxy is just one entry, e.g.
+	// {"/api": "http://localhost:3000"}.
+	Router map[string]string `json:"router"`
+
+	// CORS
+	CORS   bool   `json:"cors"`   // enable CORS header handling
+	Origin string `json:"origin"` // Access-Control-Allow-Origin; "" reflects the request's Origin header
+
+	Routes map[string]string `json:"routes"` // static path rewrite: request path -> file path
 	Mocks  []MockAPI         `json:"mocks"`
+
+	// Deprecated: api/target from the old mini-live-server config shape.
+	// Only read at load time and folded into Router; never consulted
+	// afterwards. Kept so old config.json files keep working unmodified.
+	API    string `json:"api"`
+	Target string `json:"target"`
 }
 
-// Default values: used when the field is missing in config.json and not specified via command line
 const (
-	defaultDir    = "./public"
-	defaultPort   = 8080
-	defaultAPI    = "/api"
-	defaultTarget = "http://localhost:3000"
+	defaultDir  = "./public"
+	defaultPort = 8080
+	defaultAPI  = "/api"
 )
 
-// rawConfig uses pointer fields to parse JSON to distinguish between "field absent" and "field zero-valued"
+// rawConfig mirrors Config but with pointer fields, so we can tell "absent
+// from JSON" apart from "present with the zero value".
 type rawConfig struct {
-	Dir    *string            `json:"dir"`
-	Port   *int               `json:"port"`
-	API    *string            `json:"api"`
-	Target *string            `json:"target"`
-	Routes map[string]string  `json:"routes"`
-	Mocks  []MockAPI          `json:"mocks"`
+	Bind   *string           `json:"bind"`
+	Port   *int              `json:"port"`
+	Dir    *string           `json:"dir"`
+	Router map[string]string `json:"router"`
+	CORS   *bool             `json:"cors"`
+	Origin *string           `json:"origin"`
+	Routes map[string]string `json:"routes"`
+	Mocks  []MockAPI         `json:"mocks"`
+	API    *string           `json:"api"`    // deprecated, folded into Router
+	Target *string           `json:"target"` // deprecated, folded into Router
 }
 
-// loadConfig loads configuration from a JSON file; fills missing fields or non-existent files with hardcoded defaults
 func loadConfig(filePath string) (*Config, error) {
 	cfg := &Config{
 		Dir:    defaultDir,
 		Port:   defaultPort,
-		API:    defaultAPI,
-		Target: defaultTarget,
+		Router: map[string]string{},
 		Routes: map[string]string{},
 		Mocks:  []MockAPI{},
 	}
@@ -69,7 +97,7 @@ func loadConfig(filePath string) (*Config, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Configuration file does not exist, use default values directly (can be overridden by command-line args later)
+			// No config file: fall back to defaults, flags may still override.
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("failed to read config file: %v", err)
@@ -80,17 +108,29 @@ func loadConfig(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config JSON: %v", err)
 	}
 
-	if raw.Dir != nil {
-		cfg.Dir = *raw.Dir
+	if raw.Bind != nil {
+		cfg.Bind = *raw.Bind
 	}
 	if raw.Port != nil {
 		cfg.Port = *raw.Port
+	}
+	if raw.Dir != nil {
+		cfg.Dir = *raw.Dir
+	}
+	if raw.Router != nil {
+		cfg.Router = raw.Router
 	}
 	if raw.API != nil {
 		cfg.API = *raw.API
 	}
 	if raw.Target != nil {
 		cfg.Target = *raw.Target
+	}
+	if raw.CORS != nil {
+		cfg.CORS = *raw.CORS
+	}
+	if raw.Origin != nil {
+		cfg.Origin = *raw.Origin
 	}
 	if raw.Routes != nil {
 		cfg.Routes = raw.Routes
@@ -102,41 +142,179 @@ func loadConfig(filePath string) (*Config, error) {
 	return cfg, nil
 }
 
-// findMockAPI checks if there is a matching Mock endpoint for the current request path and method
+// resolveBind turns Bind/Port into a final listen address, preferring an
+// explicit Bind.
+func (c *Config) resolveBind() string {
+	if strings.TrimSpace(c.Bind) != "" {
+		return c.Bind
+	}
+	port := c.Port
+	if port == 0 {
+		port = defaultPort
+	}
+	return fmt.Sprintf(":%d", port)
+}
+
+// foldLegacyProxyFields folds the deprecated single-backend api/target pair
+// into a Router entry, so the rest of the program only ever has to think
+// about Router. Called once after config + flags are fully resolved.
+// An explicit Router entry for the same prefix always wins.
+func (c *Config) foldLegacyProxyFields() {
+	if c.Target == "" {
+		return
+	}
+	prefix := c.API
+	if strings.TrimSpace(prefix) == "" {
+		prefix = defaultAPI
+	}
+	prefix = "/" + strings.Trim(prefix, "/")
+
+	if c.Router == nil {
+		c.Router = map[string]string{}
+	}
+	if _, exists := c.Router[prefix]; !exists {
+		c.Router[prefix] = c.Target
+		fmt.Printf("Folded deprecated api/target into router: %s -> %s\n", prefix, c.Target)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mock API matching
+// ---------------------------------------------------------------------------
+
 func findMockAPI(mocks []MockAPI, path string, method string) *MockAPI {
-	for _, m := range mocks {
+	for i := range mocks {
+		m := &mocks[i]
 		methodMatch := m.Method == "" || strings.EqualFold(m.Method, method)
 		if methodMatch && strings.EqualFold(m.Path, path) {
-			return &m
+			return m
 		}
 	}
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Reverse proxy: multi-prefix router (from gocors) + single target (legacy)
+// ---------------------------------------------------------------------------
+
+// routeTable holds parsed backend URLs keyed by path prefix, sorted longest
+// prefix first so overlapping prefixes resolve deterministically.
+type routeTable struct {
+	prefixes []string
+	targets  map[string]*url.URL
+}
+
+func newRouteTable(router map[string]string) (*routeTable, error) {
+	rt := &routeTable{targets: map[string]*url.URL{}}
+	for prefix, raw := range router {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid router target for prefix %q: %v", prefix, err)
+		}
+		rt.prefixes = append(rt.prefixes, prefix)
+		rt.targets[prefix] = u
+	}
+	sort.Slice(rt.prefixes, func(i, j int) bool {
+		return len(rt.prefixes[i]) > len(rt.prefixes[j])
+	})
+	return rt, nil
+}
+
+func (rt *routeTable) match(path string) (*url.URL, bool) {
+	for _, prefix := range rt.prefixes {
+		if strings.HasPrefix(path, prefix) {
+			return rt.targets[prefix], true
+		}
+	}
+	return nil, false
+}
+
+// buildProxy creates a single httputil.ReverseProxy driven entirely by the
+// prefix -> backend router table.
+func buildProxy(rt *routeTable) *httputil.ReverseProxy {
+	director := func(req *http.Request) {
+		target, ok := rt.match(req.URL.Path)
+		if !ok {
+			return
+		}
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = target.Host
+		if target.Path != "" && target.Path != "/" {
+			req.URL.Path = strings.TrimRight(target.Path, "/") + req.URL.Path
+		}
+	}
+	return &httputil.ReverseProxy{
+		Director: director,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[Proxy Error] %s: %v", r.URL.Path, err)
+			http.Error(w, "Bad Gateway: Failed to proxy request", http.StatusBadGateway)
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CORS (from gocors)
+// ---------------------------------------------------------------------------
+
+func corsMiddleware(cfg *Config, next http.Handler) http.Handler {
+	if !cfg.CORS {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := cfg.Origin
+		if origin == "" {
+			origin = r.Header.Get("Origin")
+		}
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods",
+				"GET, PUT, POST, HEAD, TRACE, DELETE, PATCH, COPY, LINK, OPTIONS")
+		}
+
+		if r.Method == http.MethodOptions {
+			if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+				w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
 func main() {
-	// 1. -c / -config points to the unified config file (both flags bind to the same variable)
 	configPath := "./config.json"
 	flag.StringVar(&configPath, "config", "./config.json", "Path to config JSON file")
 	flag.StringVar(&configPath, "c", "./config.json", "Path to config JSON file (shorthand)")
 
-	// 2. Keep standalone parameters to override config.json when explicitly passed
+	bindFlag := flag.String("bind", "", "Listen address, e.g. :8080 (overrides config.json)")
 	dirFlag := flag.String("dir", "", "Root directory for static files (overrides config.json)")
-	portFlag := flag.Int("port", 0, "Server listening port (overrides config.json)")
-	apiFlag := flag.String("api", "", "API route prefix (overrides config.json)")
-	targetFlag := flag.String("target", "", "Target backend URL for API proxying (overrides config.json)")
+	portFlag := flag.Int("port", 0, "Server listening port, legacy alias for -bind (overrides config.json)")
+	apiFlag := flag.String("api", "", "Deprecated: path prefix paired with -target, folded into router (overrides config.json)")
+	targetFlag := flag.String("target", "", "Deprecated: single backend URL, folded into router (overrides config.json)")
+	corsFlag := flag.Bool("cors", false, "Enable CORS header handling (overrides config.json)")
+	originFlag := flag.String("origin", "", "Access-Control-Allow-Origin value; empty reflects request Origin (overrides config.json)")
 
 	flag.Parse()
 
-	// 3. Load config.json, filling missing fields with default values
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("Error loading config: %v", err)
 	}
 
-	// 4. Only flags explicitly passed via command line will override config.json values,
-	//    preventing unpassed flags' default zero values (e.g., port=0) from accidentally overwriting config file settings
+	// Only flags explicitly passed on the command line override config.json,
+	// so unpassed flags' zero values never clobber file-based settings.
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "bind":
+			cfg.Bind = *bindFlag
 		case "dir":
 			cfg.Dir = *dirFlag
 		case "port":
@@ -145,14 +323,27 @@ func main() {
 			cfg.API = *apiFlag
 		case "target":
 			cfg.Target = *targetFlag
+		case "cors":
+			cfg.CORS = *corsFlag
+		case "origin":
+			cfg.Origin = *originFlag
 		}
 	})
 
-	addr := fmt.Sprintf(":%d", cfg.Port)
-	formattedApiPath := "/" + strings.Trim(cfg.API, "/")
+	// Fold the deprecated api/target pair into Router so everything past
+	// this point only has one proxy concept to deal with.
+	cfg.foldLegacyProxyFields()
 
-	if _, err := os.Stat(cfg.Dir); os.IsNotExist(err) {
-		log.Fatalf("Error: Specified static directory '%s' does not exist!", cfg.Dir)
+	addr := cfg.resolveBind()
+
+	// Static serving is optional: a proxy-only deployment (the old gocors
+	// use case) simply omits/clears "dir".
+	staticEnabled := cfg.Dir != ""
+	if staticEnabled {
+		if _, err := os.Stat(cfg.Dir); os.IsNotExist(err) {
+			log.Printf("Warning: static directory %q does not exist, static serving disabled", cfg.Dir)
+			staticEnabled = false
+		}
 	}
 
 	if len(cfg.Routes) > 0 {
@@ -161,44 +352,38 @@ func main() {
 	if len(cfg.Mocks) > 0 {
 		fmt.Printf("Loaded %d mock API endpoint(s) from %s\n", len(cfg.Mocks), configPath)
 	}
-
-	// 5. Configure reverse proxy handler
-	var proxyHandler http.Handler
-	if cfg.Target != "" {
-		targetURL, err := url.Parse(cfg.Target)
-		if err != nil {
-			log.Fatalf("Invalid proxy target URL format: %v", err)
-		}
-
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[Proxy Error] %s -> %s: %v", r.URL.Path, targetURL, err)
-			http.Error(w, "Bad Gateway: Failed to proxy request", http.StatusBadGateway)
-		}
-
-		proxyHandler = proxy
-		fmt.Printf("API Proxy enabled: %s/* -> %s/*\n", formattedApiPath, cfg.Target)
+	if len(cfg.Router) > 0 {
+		fmt.Printf("Loaded %d proxy router prefix(es) from %s\n", len(cfg.Router), configPath)
 	}
 
-	// 6. Static file handler
-	fileServer := http.FileServer(http.Dir(cfg.Dir))
+	rt, err := newRouteTable(cfg.Router)
+	if err != nil {
+		log.Fatalf("Error parsing router config: %v", err)
+	}
 
-	// 7. Main router logic
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Step A: Priority check for matching Mock RESTful API
+	var proxyHandler http.Handler
+	if len(cfg.Router) > 0 {
+		proxyHandler = buildProxy(rt)
+	}
+
+	var fileServer http.Handler
+	if staticEnabled {
+		fileServer = http.FileServer(http.Dir(cfg.Dir))
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Step A: mock APIs take priority over everything else.
 		if mock := findMockAPI(cfg.Mocks, r.URL.Path, r.Method); mock != nil {
 			if mock.DelayMS > 0 {
 				time.Sleep(time.Duration(mock.DelayMS) * time.Millisecond)
 			}
-
 			status := mock.Status
 			if status == 0 {
 				status = http.StatusOK
 			}
-
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(status)
-
 			if err := json.NewEncoder(w).Encode(mock.Response); err != nil {
 				log.Printf("[Mock API Error] Failed to respond to %s: %v", r.URL.Path, err)
 			}
@@ -206,18 +391,25 @@ func main() {
 			return
 		}
 
-		// Step B: If no Mock matched, check if request should go through backend API proxy
-		if proxyHandler != nil && (r.URL.Path == formattedApiPath || strings.HasPrefix(r.URL.Path, formattedApiPath+"/")) {
-			proxyHandler.ServeHTTP(w, r)
+		// Step B: proxy — router prefix match.
+		if proxyHandler != nil {
+			if _, ok := rt.match(r.URL.Path); ok {
+				proxyHandler.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		if !staticEnabled {
+			http.NotFound(w, r)
 			return
 		}
 
-		// Step C: Route rewrite logic (matches page mappings)
+		// Step C: static path rewrite.
 		if targetFile, exists := cfg.Routes[r.URL.Path]; exists {
 			r.URL.Path = "/" + strings.TrimPrefix(targetFile, "/")
 		}
 
-		// Step D: Serve static assets/pages
+		// Step D: serve static assets/pages.
 		filePath := filepath.Join(cfg.Dir, filepath.Clean(r.URL.Path))
 		info, err := os.Stat(filePath)
 		if err != nil {
@@ -240,11 +432,22 @@ func main() {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	fmt.Printf("Config file: %s\n", configPath)
-	fmt.Printf("Web server running at: http://localhost%s\n", addr)
-	fmt.Printf("Static directory: %s\n", cfg.Dir)
+	handler := corsMiddleware(cfg, mux)
 
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	fmt.Printf("Config file: %s\n", configPath)
+	fmt.Printf("Server running at: http://localhost%s\n", addr)
+	if staticEnabled {
+		fmt.Printf("Static directory: %s\n", cfg.Dir)
+	}
+	if cfg.CORS {
+		originDesc := cfg.Origin
+		if originDesc == "" {
+			originDesc = "(reflects request Origin)"
+		}
+		fmt.Printf("CORS enabled, Allow-Origin: %s\n", originDesc)
+	}
+
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal("Server failed to start: ", err)
 	}
 }
