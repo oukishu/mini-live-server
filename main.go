@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -13,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // ---------------------------------------------------------------------------
@@ -29,29 +33,68 @@ type MockAPI struct {
 	Response any    `json:"response"`
 }
 
+// RouteTarget describes a single router entry: the backend origin to
+// forward to, and an optional upstream proxy to dial that backend through.
+//
+// Accepts two JSON shapes:
+//
+//	"/api": "http://localhost:3000"
+//
+// or, when a proxy is needed:
+//
+//	"/api": {"backend": "http://localhost:3000", "proxy": "socks5://127.0.0.1:1080"}
+//
+// Proxy is optional — leave it empty (or use the plain string form) to talk
+// to the backend directly. Supported proxy schemes: http://, https://,
+// socks5://.
+type RouteTarget struct {
+	Backend string `json:"backend"`
+	Proxy   string `json:"proxy"`
+}
+
+// UnmarshalJSON allows a router entry to be either a plain backend URL
+// string or a {"backend": "...", "proxy": "..."} object.
+func (rt *RouteTarget) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		rt.Backend = s
+		rt.Proxy = ""
+		return nil
+	}
+
+	type alias RouteTarget
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*rt = RouteTarget(a)
+	return nil
+}
+
 // Config is the full, unified configuration. It merges what used to be two
 // separate tools:
 //   - mini-live-server: static file serving, mock APIs, path rewrites
 //   - gocors: CORS handling and multi-prefix reverse proxying
 //
-// There is exactly one proxy concept: Router, a map of path prefix -> backend
-// origin. A single-backend setup is just a Router with one entry.
+// There is exactly one proxy concept: Router, a map of path prefix -> route
+// target. A single-backend setup is just a Router with one entry. Each
+// entry may independently opt into forwarding through an HTTP or SOCKS5
+// proxy.
 type Config struct {
 	Bind string `json:"bind"` // listen address, e.g. ":8080" or "127.0.0.1:8080"
-	Port int    `json:"port"` // legacy alternative to Bind (":<port>")
 	Dir  string `json:"dir"`  // static file root; "" disables static serving
 
-	// Router maps a path prefix to a backend origin. The longest matching
+	// Router maps a path prefix to a route target. The longest matching
 	// prefix wins. A single-backend proxy is just one entry, e.g.
 	// {"/api": "http://localhost:3000"}.
-	Router map[string]string `json:"router"`
+	Router map[string]RouteTarget `json:"router"`
 
 	// CORS
 	CORS   bool   `json:"cors"`   // enable CORS header handling
 	Origin string `json:"origin"` // Access-Control-Allow-Origin; "" reflects the request's Origin header
 
 	Routes map[string]string `json:"routes"` // static path rewrite: request path -> file path
-	Mocks  []MockAPI         `json:"mocks"`
+	Mocks  []MockAPI          `json:"mocks"`
 
 	// Deprecated: api/target from the old mini-live-server config shape.
 	// Only read at load time and folded into Router; never consulted
@@ -62,30 +105,29 @@ type Config struct {
 
 const (
 	defaultDir  = "./public"
-	defaultPort = 8080
+	defaultBind = ":8080"
 	defaultAPI  = "/api"
 )
 
 // rawConfig mirrors Config but with pointer fields, so we can tell "absent
 // from JSON" apart from "present with the zero value".
 type rawConfig struct {
-	Bind   *string           `json:"bind"`
-	Port   *int              `json:"port"`
-	Dir    *string           `json:"dir"`
-	Router map[string]string `json:"router"`
-	CORS   *bool             `json:"cors"`
-	Origin *string           `json:"origin"`
-	Routes map[string]string `json:"routes"`
-	Mocks  []MockAPI         `json:"mocks"`
-	API    *string           `json:"api"`    // deprecated, folded into Router
-	Target *string           `json:"target"` // deprecated, folded into Router
+	Bind   *string                `json:"bind"`
+	Dir    *string                `json:"dir"`
+	Router map[string]RouteTarget `json:"router"`
+	CORS   *bool                  `json:"cors"`
+	Origin *string                `json:"origin"`
+	Routes map[string]string      `json:"routes"`
+	Mocks  []MockAPI              `json:"mocks"`
+	API    *string                `json:"api"`    // deprecated, folded into Router
+	Target *string                `json:"target"` // deprecated, folded into Router
 }
 
 func loadConfig(filePath string) (*Config, error) {
 	cfg := &Config{
 		Dir:    defaultDir,
-		Port:   defaultPort,
-		Router: map[string]string{},
+		Bind:   defaultBind,
+		Router: map[string]RouteTarget{},
 		Routes: map[string]string{},
 		Mocks:  []MockAPI{},
 	}
@@ -110,9 +152,6 @@ func loadConfig(filePath string) (*Config, error) {
 
 	if raw.Bind != nil {
 		cfg.Bind = *raw.Bind
-	}
-	if raw.Port != nil {
-		cfg.Port = *raw.Port
 	}
 	if raw.Dir != nil {
 		cfg.Dir = *raw.Dir
@@ -142,17 +181,13 @@ func loadConfig(filePath string) (*Config, error) {
 	return cfg, nil
 }
 
-// resolveBind turns Bind/Port into a final listen address, preferring an
-// explicit Bind.
+// resolveBind returns the final listen address, falling back to
+// defaultBind when nothing was configured.
 func (c *Config) resolveBind() string {
 	if strings.TrimSpace(c.Bind) != "" {
 		return c.Bind
 	}
-	port := c.Port
-	if port == 0 {
-		port = defaultPort
-	}
-	return fmt.Sprintf(":%d", port)
+	return defaultBind
 }
 
 // foldLegacyProxyFields folds the deprecated single-backend api/target pair
@@ -170,10 +205,10 @@ func (c *Config) foldLegacyProxyFields() {
 	prefix = "/" + strings.Trim(prefix, "/")
 
 	if c.Router == nil {
-		c.Router = map[string]string{}
+		c.Router = map[string]RouteTarget{}
 	}
 	if _, exists := c.Router[prefix]; !exists {
-		c.Router[prefix] = c.Target
+		c.Router[prefix] = RouteTarget{Backend: c.Target}
 		fmt.Printf("Folded deprecated api/target into router: %s -> %s\n", prefix, c.Target)
 	}
 }
@@ -194,63 +229,122 @@ func findMockAPI(mocks []MockAPI, path string, method string) *MockAPI {
 }
 
 // ---------------------------------------------------------------------------
-// Reverse proxy: multi-prefix router (from gocors) + single target (legacy)
+// Reverse proxy: multi-prefix router, each entry optionally tunneled
+// through its own HTTP or SOCKS5 proxy.
 // ---------------------------------------------------------------------------
 
-// routeTable holds parsed backend URLs keyed by path prefix, sorted longest
-// prefix first so overlapping prefixes resolve deterministically.
-type routeTable struct {
-	prefixes []string
-	targets  map[string]*url.URL
+// routeEntry is one resolved router prefix: its backend URL and a
+// ready-to-use reverse proxy (already wired to the right transport,
+// direct or via an upstream proxy).
+type routeEntry struct {
+	prefix string
+	target *url.URL
+	proxy  *httputil.ReverseProxy
 }
 
-func newRouteTable(router map[string]string) (*routeTable, error) {
-	rt := &routeTable{targets: map[string]*url.URL{}}
-	for prefix, raw := range router {
-		u, err := url.Parse(raw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid router target for prefix %q: %v", prefix, err)
-		}
-		rt.prefixes = append(rt.prefixes, prefix)
-		rt.targets[prefix] = u
+// routeTable holds resolved route entries, sorted longest prefix first so
+// overlapping prefixes resolve deterministically.
+type routeTable struct {
+	entries []routeEntry
+}
+
+// buildTransport returns an http.RoundTripper for a route entry. An empty
+// proxyURL means "talk to the backend directly". Supported proxy schemes
+// are http://, https:// (forward/CONNECT proxy) and socks5://.
+func buildTransport(proxyURL string) (http.RoundTripper, error) {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+
+	if strings.TrimSpace(proxyURL) == "" {
+		return base, nil
 	}
-	sort.Slice(rt.prefixes, func(i, j int) bool {
-		return len(rt.prefixes[i]) > len(rt.prefixes[j])
+
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL %q: %v", proxyURL, err)
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		base.Proxy = http.ProxyURL(u)
+		return base, nil
+
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if u.User != nil {
+			password, _ := u.User.Password()
+			auth = &proxy.Auth{User: u.User.Username(), Password: password}
+		}
+		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create socks5 dialer for %q: %v", proxyURL, err)
+		}
+		base.Proxy = nil
+		base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		}
+		return base, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q for %q (use http://, https:// or socks5://)", u.Scheme, proxyURL)
+	}
+}
+
+func newRouteTable(router map[string]RouteTarget) (*routeTable, error) {
+	rt := &routeTable{}
+
+	for prefix, rtgt := range router {
+		if strings.TrimSpace(rtgt.Backend) == "" {
+			return nil, fmt.Errorf("router prefix %q has no backend", prefix)
+		}
+		target, err := url.Parse(rtgt.Backend)
+		if err != nil {
+			return nil, fmt.Errorf("invalid router backend for prefix %q: %v", prefix, err)
+		}
+
+		transport, err := buildTransport(rtgt.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("router prefix %q: %v", prefix, err)
+		}
+
+		dest := target // capture for closure
+		p := &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				req.URL.Scheme = dest.Scheme
+				req.URL.Host = dest.Host
+				req.Host = dest.Host
+				if dest.Path != "" && dest.Path != "/" {
+					req.URL.Path = strings.TrimRight(dest.Path, "/") + req.URL.Path
+				}
+			},
+			Transport: transport,
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				log.Printf("[Proxy Error] %s: %v", r.URL.Path, err)
+				http.Error(w, "Bad Gateway: Failed to proxy request", http.StatusBadGateway)
+			},
+		}
+
+		rt.entries = append(rt.entries, routeEntry{prefix: prefix, target: target, proxy: p})
+
+		if rtgt.Proxy != "" {
+			fmt.Printf("Router: %s -> %s (via proxy %s)\n", prefix, rtgt.Backend, rtgt.Proxy)
+		} else {
+			fmt.Printf("Router: %s -> %s (direct)\n", prefix, rtgt.Backend)
+		}
+	}
+
+	sort.Slice(rt.entries, func(i, j int) bool {
+		return len(rt.entries[i].prefix) > len(rt.entries[j].prefix)
 	})
 	return rt, nil
 }
 
-func (rt *routeTable) match(path string) (*url.URL, bool) {
-	for _, prefix := range rt.prefixes {
-		if strings.HasPrefix(path, prefix) {
-			return rt.targets[prefix], true
+func (rt *routeTable) match(path string) (*routeEntry, bool) {
+	for i := range rt.entries {
+		if strings.HasPrefix(path, rt.entries[i].prefix) {
+			return &rt.entries[i], true
 		}
 	}
 	return nil, false
-}
-
-// buildProxy creates a single httputil.ReverseProxy driven entirely by the
-// prefix -> backend router table.
-func buildProxy(rt *routeTable) *httputil.ReverseProxy {
-	director := func(req *http.Request) {
-		target, ok := rt.match(req.URL.Path)
-		if !ok {
-			return
-		}
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.Host = target.Host
-		if target.Path != "" && target.Path != "/" {
-			req.URL.Path = strings.TrimRight(target.Path, "/") + req.URL.Path
-		}
-	}
-	return &httputil.ReverseProxy{
-		Director: director,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[Proxy Error] %s: %v", r.URL.Path, err)
-			http.Error(w, "Bad Gateway: Failed to proxy request", http.StatusBadGateway)
-		},
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +390,6 @@ func main() {
 
 	bindFlag := flag.String("bind", "", "Listen address, e.g. :8080 (overrides config.json)")
 	dirFlag := flag.String("dir", "", "Root directory for static files (overrides config.json)")
-	portFlag := flag.Int("port", 0, "Server listening port, legacy alias for -bind (overrides config.json)")
 	apiFlag := flag.String("api", "", "Deprecated: path prefix paired with -target, folded into router (overrides config.json)")
 	targetFlag := flag.String("target", "", "Deprecated: single backend URL, folded into router (overrides config.json)")
 	corsFlag := flag.Bool("cors", false, "Enable CORS header handling (overrides config.json)")
@@ -317,8 +410,6 @@ func main() {
 			cfg.Bind = *bindFlag
 		case "dir":
 			cfg.Dir = *dirFlag
-		case "port":
-			cfg.Port = *portFlag
 		case "api":
 			cfg.API = *apiFlag
 		case "target":
@@ -352,19 +443,16 @@ func main() {
 	if len(cfg.Mocks) > 0 {
 		fmt.Printf("Loaded %d mock API endpoint(s) from %s\n", len(cfg.Mocks), configPath)
 	}
-	if len(cfg.Router) > 0 {
-		fmt.Printf("Loaded %d proxy router prefix(es) from %s\n", len(cfg.Router), configPath)
-	}
 
 	rt, err := newRouteTable(cfg.Router)
 	if err != nil {
 		log.Fatalf("Error parsing router config: %v", err)
 	}
-
-	var proxyHandler http.Handler
 	if len(cfg.Router) > 0 {
-		proxyHandler = buildProxy(rt)
+		fmt.Printf("Loaded %d proxy router prefix(es) from %s\n", len(cfg.Router), configPath)
 	}
+
+	proxyEnabled := len(cfg.Router) > 0
 
 	var fileServer http.Handler
 	if staticEnabled {
@@ -391,10 +479,11 @@ func main() {
 			return
 		}
 
-		// Step B: proxy — router prefix match.
-		if proxyHandler != nil {
-			if _, ok := rt.match(r.URL.Path); ok {
-				proxyHandler.ServeHTTP(w, r)
+		// Step B: proxy — router prefix match (each entry direct or via
+		// its own HTTP/SOCKS5 proxy, per config).
+		if proxyEnabled {
+			if entry, ok := rt.match(r.URL.Path); ok {
+				entry.proxy.ServeHTTP(w, r)
 				return
 			}
 		}
