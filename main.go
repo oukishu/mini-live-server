@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -144,6 +145,13 @@ func loadConfig(filePath string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
+
+	// Strip a leading UTF-8 BOM, if present. Some editors (Notepad, VS Code
+	// set to "UTF-8 with BOM", etc.) save config.json with a BOM, which
+	// encoding/json rejects with a cryptic "invalid character '\xef' looking
+	// for beginning of value" error even though the file is otherwise valid
+	// JSON.
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 
 	var raw rawConfig
 	if err := json.Unmarshal(data, &raw); err != nil {
